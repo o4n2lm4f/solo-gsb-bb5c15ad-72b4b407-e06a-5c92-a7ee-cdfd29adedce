@@ -1,10 +1,11 @@
 """FastAPI application: local CIDR address lease API."""
 
+import re
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request, status
+from fastapi import Depends, FastAPI, Header, Request, status
 from fastapi.responses import JSONResponse
 
 from . import audit, service
@@ -92,15 +93,37 @@ def list_reservations(pool_id: int, db: sqlite3.Connection = Depends(get_db)) ->
 
 # ---------- leases ----------
 
+# 1-128 visible ASCII characters (0x21-0x7E, no whitespace).
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[!-~]{1,128}$")
+
+
+def _validate_idempotency_key(key: str | None) -> str | None:
+    if key is None:
+        return None
+    if not _IDEMPOTENCY_KEY_RE.fullmatch(key):
+        raise ApiError(
+            422, "Idempotency-Key must be 1-128 visible ASCII characters"
+        )
+    return key
+
+
 @app.post(
     "/pools/{pool_id}/leases",
     response_model=LeaseOut,
     status_code=status.HTTP_201_CREATED,
 )
 def allocate_lease(
-    pool_id: int, body: LeaseRequest, db: sqlite3.Connection = Depends(get_db)
+    pool_id: int,
+    body: LeaseRequest,
+    idempotency_key: str | None = Header(None),
+    db: sqlite3.Connection = Depends(get_db),
 ) -> dict:
+    key = _validate_idempotency_key(idempotency_key)
     with write_tx(db):
+        if key is not None:
+            return service.allocate_lease_idempotent(
+                db, pool_id, body.prefix_len, body.ttl_seconds, key
+            )
         return service.allocate_lease(db, pool_id, body.prefix_len, body.ttl_seconds)
 
 

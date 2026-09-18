@@ -1,6 +1,7 @@
 """Business logic: every mutating operation runs inside BEGIN IMMEDIATE."""
 
 import hashlib
+import json
 import secrets
 import sqlite3
 import time
@@ -292,6 +293,57 @@ def allocate_lease(
     )
     row = conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone()
     return _lease_row_to_dict(row)
+
+
+def allocate_lease_idempotent(
+    conn: sqlite3.Connection,
+    pool_id: int,
+    prefix_len: int,
+    ttl_seconds: int | None,
+    key: str,
+) -> dict:
+    """Idempotent allocation keyed by the Idempotency-Key header.
+
+    Runs inside the caller's BEGIN IMMEDIATE transaction, so concurrent
+    submissions of the same key serialize on the write lock: exactly one
+    lease and one ``allocate`` event are created. A repeated key with the
+    same parameters replays the stored 201 response without allocating;
+    the same key with different parameters conflicts. Failed allocations
+    roll back before the key row is inserted, so a failure never claims
+    the key.
+    """
+    ttl = ttl_seconds if ttl_seconds is not None else DEFAULT_TTL_SECONDS
+    row = conn.execute(
+        "SELECT pool_id, prefix_len, ttl_seconds, response "
+        "FROM idempotency_keys WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is not None:
+        if (
+            row["pool_id"] == pool_id
+            and row["prefix_len"] == prefix_len
+            and row["ttl_seconds"] == ttl
+        ):
+            return json.loads(row["response"])
+        raise ApiError(
+            409, "Idempotency-Key was already used with different parameters"
+        )
+
+    result = allocate_lease(conn, pool_id, prefix_len, ttl_seconds)
+    conn.execute(
+        "INSERT INTO idempotency_keys "
+        "(key, pool_id, prefix_len, ttl_seconds, response, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            key,
+            pool_id,
+            prefix_len,
+            ttl,
+            json.dumps(result, sort_keys=True),
+            _now(),
+        ),
+    )
+    return result
 
 
 def renew_lease(

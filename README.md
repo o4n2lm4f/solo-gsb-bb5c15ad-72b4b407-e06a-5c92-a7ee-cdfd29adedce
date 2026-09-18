@@ -36,6 +36,32 @@ docker compose up -d --build
 - 查询池详情返回活动租约、保留段，以及把所有空闲空间合并后的**最简 CIDR 集合**
   （相邻块合并、每段贪心取最大对齐块）。
 
+## 幂等分配
+
+`POST /pools/{id}/leases` 支持可选的 **`Idempotency-Key` 请求头**
+（1～128 个可见 ASCII 字符，即 `0x21`–`0x7E`，不含空白；不合法返回 `422`），
+用于网络重试、客户端重发等场景下的**持久化幂等**：
+
+- **首次请求**：在原有的 `BEGIN IMMEDIATE` 事务内完成分配，并把
+  **键、池 ID、规范化后的 `prefix_len`、实际 TTL（缺省解析为 3600）以及
+  成功的 201 响应体**一并写入 `idempotency_keys` 表，与租约、审计事件同生共死。
+- **相同键 + 相同参数重试**：直接返回首次的 **201 响应**（含原 token），
+  **不再分配地址、不追加审计事件**；即使原租约此后被释放或过期，重放结果不变。
+- **相同键 + 不同参数**（池、`prefix_len` 或实际 TTL 任一不同）：返回 **409**。
+- **并发提交同一键**：所有请求在同一把 SQLite 写锁上串行化，**只会产生一条
+  租约和一条 `allocate` 事件**，其余请求重放同一响应。
+- **失败请求不占键**：409（空间不足）、422（参数非法）等失败整体回滚，
+  键不会落库，修正后可用同一键重新发起。
+- 未携带该请求头时行为完全不变（每次请求独立分配）。
+
+```bash
+curl -s -X POST http://localhost:8000/pools/1/leases \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-42-alloc' \
+  -d '{"prefix_len":27,"ttl_seconds":3600}'
+# 重试同一请求（同键同参）返回与首次完全相同的 201 响应
+```
+
 ## 租约原地缩扩容
 
 `PUT /leases/{token}/resize`，请求体 `{"target_prefix_len": <int>}`：
@@ -98,7 +124,7 @@ docker compose up -d --build
 | GET | `/pools/{id}` | 池详情：保留段、活动租约、合并后的空闲 CIDR |
 | POST | `/pools/{id}/reservations` | 声明保留网段 |
 | GET | `/pools/{id}/reservations` | 列出保留网段 |
-| POST | `/pools/{id}/leases` | 按前缀长度申请租约（默认 TTL 3600 秒） |
+| POST | `/pools/{id}/leases` | 按前缀长度申请租约（默认 TTL 3600 秒；支持 `Idempotency-Key` 幂等） |
 | GET | `/leases?pool_id=` | 列出活动租约（可按池过滤） |
 | GET | `/leases/{token}` | 查询单个租约 |
 | POST | `/leases/{token}/renew` | 续租 |
@@ -245,6 +271,10 @@ pytest -q
 且 CIDR/到期时间不变、旧 token 按未知令牌 404、过期/已消费/被替换/租约非活动 409、
 8 线程并发领取同一交接码仅 1 个成功、`handoff` 审计事件与链完整性、
 响应与日志不含交接码摘要。
+幂等分配覆盖：同键同参重试返回首次 201 且不新增租约/事件、缺省 TTL 与显式 3600
+视为同参、同键不同参（池/前缀/TTL）409、失败请求（409/422）不占键、
+非法键（空、含空白/控制字符、超 128 字符）422、8 线程并发同键仅一条租约一条
+`allocate` 事件、租约释放后重放仍返回首次响应、无键请求行为不变。
 另已在 `uvicorn --workers 2` 多进程部署下验证 32 并发分配 `/24` 池中的 `/28`
 （16 个成功、块唯一且不重叠）。
 
@@ -279,3 +309,7 @@ requirements.txt
 - 交接码（`claim_code`）仅在签发响应中明文出现一次，数据库只存其 SHA-256 摘要；
   领取在单个写事务内完成「校验 → 消费 → 轮换 token → 追加 `handoff` 事件」，
   与租约分配共用同一把 SQLite 写锁，并发领取天然串行化。
+- 幂等键（`Idempotency-Key`）与租约分配在同一 `BEGIN IMMEDIATE` 事务内落库：
+  键为表主键，参数（池、`prefix_len`、实际 TTL）与首个 201 响应体同行保存；
+  重试在写锁内先查键——命中且参数一致则重放响应，参数不同则 409，未命中才分配，
+  因此并发同键请求只产生一条租约和一条 `allocate` 事件，失败回滚不占键。
