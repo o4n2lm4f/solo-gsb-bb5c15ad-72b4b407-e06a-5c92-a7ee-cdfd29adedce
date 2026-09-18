@@ -77,6 +77,19 @@ CREATE TABLE IF NOT EXISTS lease_handoffs (
     consumed_at INTEGER
 );
 
+-- Idempotent lease allocation: one row per Idempotency-Key that produced a
+-- lease. The row is inserted inside the same BEGIN IMMEDIATE transaction as
+-- the allocation itself, so concurrent retries of the same key serialize at
+-- the database level and failed requests never occupy a key.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key         TEXT PRIMARY KEY,
+    pool_id     INTEGER NOT NULL REFERENCES pools(id),
+    prefix_len  INTEGER NOT NULL,
+    ttl_seconds INTEGER NOT NULL,  -- effective TTL (default already applied)
+    response    TEXT NOT NULL,     -- canonical JSON of the first 201 body
+    created_at  INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_reservations_pool ON reservations(pool_id);
 CREATE INDEX IF NOT EXISTS idx_leases_pool_status ON leases(pool_id, status);
 CREATE INDEX IF NOT EXISTS idx_leases_token ON leases(token);

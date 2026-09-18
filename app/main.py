@@ -4,7 +4,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request, status
+from fastapi import Depends, FastAPI, Header, Request, status
 from fastapi.responses import JSONResponse
 
 from . import audit, service
@@ -98,10 +98,15 @@ def list_reservations(pool_id: int, db: sqlite3.Connection = Depends(get_db)) ->
     status_code=status.HTTP_201_CREATED,
 )
 def allocate_lease(
-    pool_id: int, body: LeaseRequest, db: sqlite3.Connection = Depends(get_db)
+    pool_id: int,
+    body: LeaseRequest,
+    idempotency_key: str | None = Header(default=None),
+    db: sqlite3.Connection = Depends(get_db),
 ) -> dict:
     with write_tx(db):
-        return service.allocate_lease(db, pool_id, body.prefix_len, body.ttl_seconds)
+        return service.allocate_lease(
+            db, pool_id, body.prefix_len, body.ttl_seconds, idempotency_key
+        )
 
 
 @app.get("/leases", response_model=list[LeaseOut])

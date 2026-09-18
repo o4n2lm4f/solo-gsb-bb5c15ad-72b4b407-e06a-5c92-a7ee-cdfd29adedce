@@ -190,6 +190,228 @@ def test_concurrent_allocations_never_overlap(client):
     assert len(set(tokens)) == 8
 
 
+# ---------- idempotent allocation ----------
+
+def test_idempotency_replay_returns_first_response(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    headers = {"Idempotency-Key": "alloc-1"}
+    r1 = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}, headers=headers)
+    assert r1.status_code == 201
+    r2 = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}, headers=headers)
+    assert r2.status_code == 201
+    assert r2.json() == r1.json()  # same lease, same token, same timestamps
+
+    # exactly one lease exists and exactly one allocate event was appended
+    leases = client.get("/leases", params={"pool_id": pid}).json()
+    assert [l["id"] for l in leases] == [r1.json()["id"]]
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate"]
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
+def test_idempotency_no_key_keeps_existing_behavior(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    r1 = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27})
+    r2 = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27})
+    assert r1.status_code == r2.status_code == 201
+    assert r1.json()["token"] != r2.json()["token"]
+    assert r1.json()["cidr"] != r2.json()["cidr"]
+    assert [e["action"] for e in client.get("/audit/events").json()] == [
+        "allocate",
+        "allocate",
+    ]
+
+
+def test_idempotency_distinct_keys_allocate_independently(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    r1 = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 27},
+        headers={"Idempotency-Key": "key-a"},
+    )
+    r2 = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 27},
+        headers={"Idempotency-Key": "key-b"},
+    )
+    assert r1.status_code == r2.status_code == 201
+    assert r1.json()["token"] != r2.json()["token"]
+
+
+def test_idempotency_same_key_different_params_409(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    other = _create_pool(client, "other", "192.168.0.0/24")
+    headers = {"Idempotency-Key": "k-conflict"}
+    r = client.post(
+        f"/pools/{pid}/leases",
+        json={"prefix_len": 27, "ttl_seconds": 3600},
+        headers=headers,
+    )
+    assert r.status_code == 201
+
+    url = f"/pools/{pid}/leases"
+    # different prefix_len, different ttl, or different pool -> 409
+    assert client.post(
+        url, json={"prefix_len": 28, "ttl_seconds": 3600}, headers=headers
+    ).status_code == 409
+    assert client.post(
+        url, json={"prefix_len": 27, "ttl_seconds": 7200}, headers=headers
+    ).status_code == 409
+    assert client.post(
+        f"/pools/{other}/leases",
+        json={"prefix_len": 27, "ttl_seconds": 3600},
+        headers=headers,
+    ).status_code == 409
+
+    # conflicts allocate nothing and append no events
+    assert len(client.get("/leases").json()) == 1
+    assert [e["action"] for e in client.get("/audit/events").json()] == ["allocate"]
+
+
+def test_idempotency_normalized_params_match(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    headers = {"Idempotency-Key": "k-normalized"}
+    r1 = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}, headers=headers)
+    assert r1.status_code == 201
+    # omitting ttl_seconds normalizes to the default: an explicit 3600 matches
+    r2 = client.post(
+        f"/pools/{pid}/leases",
+        json={"prefix_len": 27, "ttl_seconds": 3600},
+        headers=headers,
+    )
+    assert r2.status_code == 201
+    assert r2.json() == r1.json()
+    assert [e["action"] for e in client.get("/audit/events").json()] == ["allocate"]
+
+
+def test_idempotency_failed_request_does_not_occupy_key(client):
+    pid = _create_pool(client, cidr="10.0.0.0/30")
+    headers = {"Idempotency-Key": "k-failure"}
+
+    # 404 (unknown pool) and 422 (bad prefix) failures must not store the key
+    assert client.post(
+        "/pools/999/leases", json={"prefix_len": 24}, headers=headers
+    ).status_code == 404
+    assert client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 20}, headers=headers
+    ).status_code == 422
+
+    # exhaust the pool, then a 409 failure must not store the key either
+    l1 = client.post(f"/pools/{pid}/leases", json={"prefix_len": 31}).json()
+    assert client.post(f"/pools/{pid}/leases", json={"prefix_len": 31}).status_code == 201
+    assert client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 31}, headers=headers
+    ).status_code == 409
+
+    # the key is still free: the first successful use allocates and stores it
+    assert client.post(f"/leases/{l1['token']}/release").status_code == 200
+    r1 = client.post(f"/pools/{pid}/leases", json={"prefix_len": 31}, headers=headers)
+    assert r1.status_code == 201
+    r2 = client.post(f"/pools/{pid}/leases", json={"prefix_len": 31}, headers=headers)
+    assert r2.status_code == 201
+    assert r2.json() == r1.json()
+
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == [
+        "allocate",
+        "allocate",
+        "release",
+        "allocate",
+    ]
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
+def test_idempotency_key_format_validation(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    url = f"/pools/{pid}/leases"
+    # 1 and 128 visible ASCII characters are accepted
+    assert client.post(
+        url, json={"prefix_len": 28}, headers={"Idempotency-Key": "x"}
+    ).status_code == 201
+    assert client.post(
+        url, json={"prefix_len": 28}, headers={"Idempotency-Key": "k" * 128}
+    ).status_code == 201
+    # empty, overlong, or containing non-visible characters -> 422
+    assert client.post(
+        url, json={"prefix_len": 28}, headers={"Idempotency-Key": ""}
+    ).status_code == 422
+    assert client.post(
+        url, json={"prefix_len": 28}, headers={"Idempotency-Key": "k" * 129}
+    ).status_code == 422
+    assert client.post(
+        url, json={"prefix_len": 28}, headers={"Idempotency-Key": "has space"}
+    ).status_code == 422
+    assert client.post(
+        url, json={"prefix_len": 28}, headers={"Idempotency-Key": "tab\there"}
+    ).status_code == 422
+    assert client.post(
+        url, json={"prefix_len": 28}, headers={"Idempotency-Key": "del\x7fhere"}
+    ).status_code == 422
+    # rejected keys allocate nothing and append no events
+    assert len(client.get("/leases").json()) == 2
+    assert [e["action"] for e in client.get("/audit/events").json()] == [
+        "allocate",
+        "allocate",
+    ]
+
+
+def test_idempotency_replay_after_release_returns_original_response(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    headers = {"Idempotency-Key": "k-released"}
+    lease = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 27}, headers=headers
+    ).json()
+    assert client.post(f"/leases/{lease['token']}/release").status_code == 200
+    # the replay still returns the first 201 response and allocates nothing
+    r = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}, headers=headers)
+    assert r.status_code == 201
+    assert r.json() == lease
+    assert client.get("/leases", params={"pool_id": pid}).json() == []
+
+
+def test_idempotency_replay_appends_no_events(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    # a short-lived lease that will be expired by the time of the replay
+    client.post(f"/pools/{pid}/leases", json={"prefix_len": 28, "ttl_seconds": 1})
+    headers = {"Idempotency-Key": "k-noop"}
+    first = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 28}, headers=headers
+    )
+    assert first.status_code == 201
+    before = client.get("/audit/events").json()
+
+    time.sleep(1.2)
+    again = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 28}, headers=headers
+    )
+    assert again.status_code == 201
+    assert again.json() == first.json()
+    # the replay is a pure read: no allocation, no sweep, no events of any kind
+    assert client.get("/audit/events").json() == before
+
+
+def test_idempotency_concurrent_same_key_single_lease(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    headers = {"Idempotency-Key": "k-race"}
+
+    def allocate(_):
+        return client.post(
+            f"/pools/{pid}/leases", json={"prefix_len": 28}, headers=headers
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(allocate, range(8)))
+
+    # every request gets the first allocation's 201 response
+    assert all(r.status_code == 201 for r in results)
+    assert len({r.json()["token"] for r in results}) == 1
+    # exactly one lease and one allocate event were produced
+    leases = client.get("/leases", params={"pool_id": pid}).json()
+    assert len(leases) == 1
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate"]
+    _assert_chain_linkage(events)
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
 # ---------- audit chain ----------
 
 GENESIS = "0" * 64

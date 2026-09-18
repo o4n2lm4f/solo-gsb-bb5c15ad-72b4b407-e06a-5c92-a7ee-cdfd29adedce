@@ -1,6 +1,7 @@
 """Business logic: every mutating operation runs inside BEGIN IMMEDIATE."""
 
 import hashlib
+import json
 import secrets
 import sqlite3
 import time
@@ -204,6 +205,21 @@ def list_reservations(conn: sqlite3.Connection, pool_id: int) -> list[dict]:
 
 # ---------- leases ----------
 
+IDEMPOTENCY_KEY_MAX_LEN = 128
+
+
+def _validate_idempotency_key(key: str) -> None:
+    """Keys are 1-128 visible ASCII characters ('!'..'~': no spaces, no
+    control characters, no DEL, no non-ASCII)."""
+    if not 1 <= len(key) <= IDEMPOTENCY_KEY_MAX_LEN or any(
+        not "!" <= ch <= "~" for ch in key
+    ):
+        raise ApiError(
+            422,
+            "Idempotency-Key must be 1-128 visible ASCII characters",
+        )
+
+
 def _lease_row_to_dict(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
@@ -234,11 +250,15 @@ def allocate_lease(
     pool_id: int,
     prefix_len: int,
     ttl_seconds: int | None = None,
+    idempotency_key: str | None = None,
 ) -> dict:
     now = _now()
     ttl = ttl_seconds if ttl_seconds is not None else DEFAULT_TTL_SECONDS
     if ttl <= 0:
         raise ApiError(422, "ttl_seconds must be positive")
+
+    if idempotency_key is not None:
+        _validate_idempotency_key(idempotency_key)
 
     pool = _get_pool(conn, pool_id)
     pool_prefix = int(pool["cidr"].split("/")[1])
@@ -250,6 +270,29 @@ def allocate_lease(
             f"prefix_len must be between {pool_prefix} and {max_prefix} "
             f"for pool {pool['cidr']}",
         )
+
+    # Idempotent replay: a stored key with the same normalized parameters
+    # returns the first response verbatim — a pure read, so no sweep, no new
+    # lease and no audit event. The same key with different parameters is a
+    # conflict. The lookup runs under the write lock, so concurrent first
+    # uses of one key serialize and exactly one allocation happens.
+    if idempotency_key is not None:
+        stored = conn.execute(
+            "SELECT pool_id, prefix_len, ttl_seconds, response "
+            "FROM idempotency_keys WHERE key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if stored is not None:
+            if (
+                stored["pool_id"] == pool_id
+                and stored["prefix_len"] == prefix_len
+                and stored["ttl_seconds"] == ttl
+            ):
+                return json.loads(stored["response"])
+            raise ApiError(
+                409,
+                "Idempotency-Key was already used with different parameters",
+            )
 
     _sweep_pool(conn, pool_id, now)
 
@@ -291,7 +334,25 @@ def allocate_lease(
         },
     )
     row = conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone()
-    return _lease_row_to_dict(row)
+    result = _lease_row_to_dict(row)
+    if idempotency_key is not None:
+        # Persisted in the same transaction as the lease and its audit event;
+        # any failure before COMMIT rolls the key back too, so failed
+        # requests never occupy a key.
+        conn.execute(
+            "INSERT INTO idempotency_keys "
+            "(key, pool_id, prefix_len, ttl_seconds, response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                idempotency_key,
+                pool_id,
+                prefix_len,
+                ttl,
+                json.dumps(result, sort_keys=True, separators=(",", ":")),
+                now,
+            ),
+        )
+    return result
 
 
 def renew_lease(
